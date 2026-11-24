@@ -24,6 +24,7 @@ from app.services.version_release import VersionReleaseService
 from app.services.metric_board import MetricBoardService
 from app.services.sample_check import SampleCheckService
 from app.services.handoff_pack import HandoffPackService
+from app.services.recovery_todo import RecoveryTodoService
 
 SERVICES: dict[str, BaseModuleService] = {
     "flow_template": FlowTemplateService(),
@@ -48,6 +49,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "metric_board": MetricBoardService(),
     "sample_check": SampleCheckService(),
     "handoff_pack": HandoffPackService(),
+    "recovery_todo": RecoveryTodoService(),
 }
 
 

@@ -1,4 +1,4 @@
-"""跨模块数据链路：把22个独立领域服务串联成10条端到端生产流水线。
+"""跨模块数据链路：把23个独立领域服务串联成10条端到端生产流水线。
 
 每条链路从上游模块取输入数据，做领域校验、转换与状态推进后，把产物写入下游模块：
 链路1  流程模板发布 → 排程触发 → 任务队列派发 → 机器人节点执行 → 步骤轨迹
@@ -6,7 +6,7 @@
 链路3  凭据轮换 → 审计轨迹
 链路4  异常规则匹配 → 重试策略执行 → 审计轨迹
 链路5  元素定位漂移 → 流程执行异常 → 异常规则匹配
-链路6  表单字段校验 → 步骤轨迹异常 → 重试恢复
+链路6  表单字段校验 → 步骤轨迹复核清单 → 恢复待办联动
 链路7  版本灰度发布 → 流程执行回滚 → 版本绑定切换
 链路8  资源额度耗尽 → 机器人节点降级 → 任务队列回收
 链路9  OCR识别区域 → 采集批次归集 → 抽检样本 → 交接包驳回
@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from app.services import service_for
+from app.services.form_field import is_usable_basis
 
 # ── 通用工具 ──────────────────────────────────────────────────
 
@@ -392,40 +393,208 @@ def detect_element_drift(locator_id: int, flow_run_id: int) -> dict[str, Any]:
     return {"status": "drifted_no_rule", "locator_id": locator_id, "drifted": True}
 
 
-# ── 链路6: 表单字段校验 → 步骤轨迹异常 → 重试恢复 ─
+# ── 链路6: 表单字段校验 → 步骤轨迹复核清单 → 恢复待办联动 ─────────
 
-def validate_form_field(field_id: int, trace_id: int) -> dict[str, Any]:
-    """校验表单字段取值，校验失败时写入步骤轨迹异常并触发重试策略恢复。"""
+def _field_retry_policy_id() -> int | None:
+    """找到字段校验类已生效规则关联的重试策略，供补采派发联动累计重试。"""
+    rule_svc = service_for("exception_rule")
+    field_rule = next(
+        (rule for rule in rule_svc.list_entries(size=1000)[0]
+         if rule.get("status") == "已生效" and "字段" in str(rule.get("适用范围", ""))),
+        None,
+    )
+    if field_rule is None:
+        return None
+    retry_svc = service_for("retry_policy")
+    policy = next(
+        (p for p in retry_svc.list_entries(size=1000)[0]
+         if p.get("关联规则") == field_rule.get("规则编号")),
+        None,
+    )
+    return policy["id"] if policy else None
+
+
+def validate_form_field(field_id: int, trace_id: int, *,
+                        run_code: str | None = None,
+                        attempt_id: str | None = None,
+                        new_source: str | None = None,
+                        operator: str = "system") -> dict[str, Any]:
+    """校验表单字段取值，按本次实际取值依据驱动轨迹复核与恢复待办联动。
+
+    - 校验记录快照「实际参与本次采集的取值依据」，字段后续更正不改写历史；
+    - 校验通过时把结果写入步骤轨迹复核清单并复核过时异常，同时取消同字段
+      同执行下尚未实际派发的补采待办（一次更正不波及其它执行）；
+    - 校验失败时按原尝试幂等开立补采待办，重复回报不会多出补采机会。
+    """
     field_svc = service_for("form_field")
     field = _find_entry("form_field", field_id)
+    trace_svc = service_for("step_trace")
+    trace = _find_entry("step_trace", trace_id)
 
-    # 检查取值来源是否可用
-    value_source = field.get("取值来源", "")
-    validation_rule = field.get("校验规则", "")
+    run_code = run_code or trace.get("关联执行", "")
+    attempt_id = attempt_id or f"ATT-{field.get('字段编号', field_id)}-{run_code}-{_epoch_ms()}"
 
-    # 模拟校验逻辑
-    is_valid = len(value_source) > 0 and value_source != field.get("字段名称", "")
-    if not is_valid:
-        field_svc.run_action(field_id, "重新校验")
-        field_svc.run_action(field_id, "重新校验")  # 第二次标记为失败
+    # 字段更正：写入新的取值来源，随后以新依据参与本次校验
+    if new_source is not None:
+        field["取值来源"] = new_source
 
-    if field.get("status") == "校验失败":
-        # 写步骤轨迹异常
-        trace_svc = service_for("step_trace")
-        trace = _find_entry("step_trace", trace_id)
-        trace_svc.run_action(trace_id, "标记异常")
+    basis = field.get("取值来源", "")
+    valid = is_usable_basis(basis, field.get("字段名称", ""))
 
-        # 触发重试恢复
-        rule_svc = service_for("exception_rule")
-        all_rules = rule_svc.list_entries(size=1000)[0]
-        for rule in all_rules:
-            if rule.get("status") == "已生效" and rule.get("适用范围", "").find("字段") >= 0:
-                return match_exception_and_retry(
-                    f"表单字段校验失败:{field.get('字段编号')}:trace_{trace_id}",
-                    rule["id"]
-                )
+    record_result = field_svc.record_validation(
+        field_id, run_code=run_code, attempt_id=attempt_id,
+        basis=basis, valid=valid,
+        reason="" if valid else "取值来源缺失或无效，校验失败",
+    )
+    record = record_result["record"]
+    validation_id = record["validation_id"]
 
-    return {"status": "validated", "field_id": field_id, "is_valid": is_valid}
+    # 当前校验结果进入步骤轨迹的复核清单
+    trace_svc.add_review_item(trace_id, record)
+
+    if valid:
+        field_svc.run_action(field_id, "绑定取值")
+        # 复核过时异常：仅当轨迹仍处于异常态时处理，且必须有清单通过依据
+        if trace.get("status") == "异常":
+            trace_svc.review_abnormal_trace(trace_id, validation_id)
+        # 恢复待办用当前校验结果核对已领用范围，取消未实际派发的待办
+        todo_svc = service_for("recovery_todo")
+        canceled_ids = todo_svc.reconcile_with_validation(
+            field.get("字段编号", ""), run_code, validation_id)
+        return {
+            "status": "validated", "field_id": field_id, "is_valid": True,
+            "validation_id": validation_id, "basis": basis,
+            "canceled_todo_ids": canceled_ids,
+            "trace_status": trace_svc.get_entry(trace_id)["status"],
+        }
+
+    # 校验失败：登记失败状态并按原尝试幂等开立补采待办
+    field_svc.run_action(field_id, "重新校验")
+    trace_svc.mark_abnormal(trace_id)
+    failure_report = {
+        "报告编号": f"FAIL-{validation_id}",
+        "attempt_id": attempt_id,
+        "field_code": field.get("字段编号", ""),
+        "run_code": run_code,
+        "trace_id": trace_id,
+        "basis": basis,
+        "reason": "取值来源缺失或无效，校验失败",
+        "reported_at": _now_iso(),
+    }
+    todo_svc = service_for("recovery_todo")
+    todo, created = todo_svc.open_for_failure(
+        attempt_id=attempt_id,
+        field_code=field.get("字段编号", ""),
+        run_code=run_code,
+        basis=basis,
+        failure_report=failure_report,
+        trace_id=trace_id,
+        policy_id=_field_retry_policy_id(),
+        operator=operator,
+    )
+    return {
+        "status": "validation_failed", "field_id": field_id, "is_valid": False,
+        "validation_id": validation_id, "basis": basis,
+        "todo_id": todo["id"], "todo_created": created,
+        "todo_status": todo["status"],
+    }
+
+
+def replay_field_failure(field_id: int, trace_id: int, *,
+                         run_code: str, attempt_id: str,
+                         basis: str, reason: str = "迟到的原失败回报",
+                         operator: str = "system") -> dict[str, Any]:
+    """重放一次原失败回报（迟到数据）。
+
+    判断必须指向实际参与本次采集的取值依据：重放只在字段当前仍缺少有效
+    取值依据、且原尝试待办仍处于未派发状态时才成立；字段已更正通过时，
+    重放不会新增待办、不产生新的采集或重试次数，原失败回报仍可查。
+    """
+    field_svc = service_for("form_field")
+    field = _find_entry("form_field", field_id)
+    todo_svc = service_for("recovery_todo")
+    trace_svc = service_for("step_trace")
+
+    todo = todo_svc.get_by_attempt(attempt_id)
+    current_basis = field.get("取值来源", "")
+    field_now_valid = is_usable_basis(current_basis, field.get("字段名称", ""))
+
+    failure_report = {
+        "报告编号": f"FAIL-REPLAY-{attempt_id}",
+        "attempt_id": attempt_id,
+        "field_code": field.get("字段编号", ""),
+        "run_code": run_code,
+        "trace_id": trace_id,
+        "basis": basis,
+        "reason": reason,
+        "reported_at": _now_iso(),
+        "late_arrival": True,
+    }
+    # 迟到回报同样落校验记录，固化其当时依据，且按原尝试幂等
+    record_result = field_svc.record_validation(
+        field_id, run_code=run_code, attempt_id=attempt_id,
+        basis=basis, valid=False, reason=reason,
+    )
+    record = record_result["record"]
+    trace_svc.add_review_item(trace_id, record)
+
+    if field_now_valid or (todo is not None
+                           and todo.get("status") not in ("待领用", "已领用")):
+        # 字段已更正或待办已派发/终态：重放被驳回，不产生新的补采机会
+        if todo is not None:
+            todo.setdefault("迟到回报", []).append(failure_report)
+        return {
+            "status": "replay_rejected",
+            "validation_id": record["validation_id"],
+            "reason": "字段已更正通过或原尝试已派发，迟到失败不新增补采",
+            "todo_id": todo["id"] if todo else None,
+            "new_todo_created": False,
+        }
+
+    # 仍缺依据：open_for_failure 按原尝试幂等，重复提交返回原待办
+    new_todo, created = todo_svc.open_for_failure(
+        attempt_id=attempt_id,
+        field_code=field.get("字段编号", ""),
+        run_code=run_code,
+        basis=basis,
+        failure_report=failure_report,
+        trace_id=trace_id,
+        policy_id=_field_retry_policy_id(),
+        operator=operator,
+    )
+    new_todo.setdefault("迟到回报", []).append(failure_report)
+    return {
+        "status": "replay_registered" if created else "replay_deduplicated",
+        "validation_id": record["validation_id"],
+        "todo_id": new_todo["id"],
+        "new_todo_created": created,
+    }
+
+
+def continue_supplement(todo_id: int, *, operator: str = "system") -> dict[str, Any]:
+    """继续原领用的补采：实际派发并返回派发/取消结果与重试联动情况。
+
+    只有「已领用」状态的待办会真正派发一次采集并递增关联策略的累计重试；
+    已取消或已派发/终态的待办重复操作不会多出采集，结果关联回原尝试。
+    """
+    todo_svc = service_for("recovery_todo")
+    todo = todo_svc.get_entry(todo_id)
+    if todo is None:
+        return {"ok": False, "reason": "恢复待办不存在"}
+
+    if todo.get("status") == "已领用":
+        return todo_svc.dispatch_supplement(todo_id, operator=operator)
+
+    return {
+        "ok": False,
+        "dispatched": False,
+        "reason": f"待办状态为「{todo.get('status')}」，未实际派发，不产生新采集",
+        "todo_id": todo_id,
+        "todo_status": todo.get("status"),
+        "attempt_id": todo.get("attempt_id"),
+        "cancel": todo.get("取消记录"),
+    }
+
 
 
 # ── 链路7: 版本灰度发布 → 流程执行回滚 → 版本绑定切换 ─

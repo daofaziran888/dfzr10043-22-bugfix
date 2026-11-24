@@ -11,7 +11,7 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
-│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/data/modules.ts              23个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
@@ -72,6 +72,7 @@ npm run dev
 | 运行指标 | `metric_board` | 指标读数 | 读数编号、统计维度、统计窗口 |
 | 抽检样本 | `sample_check` | 抽检样本 | 样本编号、关联批次、抽样比例 |
 | 交接包 | `handoff_pack` | 交接包 | 交接编号、关联批次、目标系统 |
+| 恢复待办 | `recovery_todo` | 补采待办 | 待办编号、字段编号、关联执行、原尝试 |
 
 ## 约定
 
